@@ -1,0 +1,56 @@
+# Local environment and secrets
+.bigbakes_env
+.env
+*.pem
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local run artifacts
+last_run_summary.json
+last_email_send_result.json
+cleanup_live_only_checkpoint.json
+*_results.json
+
+# Analysis reports and exploratory outputs
+*_report.md
+*_review.md
+*_summary.json
+*_inspection.json
+*_sample.json
+*_notes.txt
+*_raw.txt
+birmingham_may_sample.json
+
+# Historical and exploratory scripts not part of deployment
+analyze_historical_deltas.py
+cleanup_live_only_fast.py
+cleanup_live_only_state.py
+delete_zero_linked_events.py
+estimate_full_run_shape.py
+explore_birmingham_structure.py
+import_historical_snapshots.py
+inspect_historical_workbook.py
+inspect_updated_logic.py
+investigate_event_count_after_cleanup.py
+parse_historical_tab_sample.py
+probe_airtable_formula_autonumber.py
+probe_airtable_view_creation.py
+probe_historical_duplicates.py
+probe_historical_row_ranges.py
+probe_historical_tabs_layout.py
+stratified_historical_sample.py
+update_weekly_deltas_review_schema.py
+verify_b1_b2_rules.py
+verify_live_only_counts.py
+airtable_view_api_notes.txt
+build_airtable_schema.py
+current_airtable_schema_raw.txt
+git_status_check.txt
+phase1_phase2_birmingham_report.md
+full_six_venue_run_report.md
+capacity_and_rule_refinement_report.md
+historical_import_completion_report.md
+historical_preimport_review.md
+historical_stratified_sample_review.md
