@@ -18,7 +18,8 @@ The attendance model uses a fixed reporting capacity of **24 seats** for every s
 | Rule A | High-velocity sales on a previously slow-selling event close to the event date. |
 | Rule B1 | API max capacity drops from positive to zero more than 21 days before the event, suggesting a likely private hire booking. |
 | Rule B2 | API max capacity drops from positive to zero within 21 days of the event while previous period sales were low, suggesting a likely manual closure. |
-| Rule C | Negative period sales, suggesting refunds, capacity changes, or scrape anomalies. |
+
+Negative `Tickets Sold This Period` values are still stored in **Weekly Deltas** for auditability, but **Rule C is deprecated** and no longer raises a review flag or populates a review reason. This change was made after evaluation showed that negative deltas were predominantly routine refund and rebooking noise handled by other systems rather than actionable weekly review signals.
 
 ## Required environment variables
 

@@ -431,8 +431,6 @@ def build_weekly_deltas(client: AirtableClient, rows: List[NormalizedEvent], scr
             review_reasons.append('Likely private hire booking — review and override with 24 if confirmed, or appropriate value if off-platform partial sale.')
         if current_api_max == 0 and previous_api_max > 0 and days_until <= 21 and int(prev_period or 0) < 5:
             review_reasons.append('Likely manual closure to improve attendance % — review and override with 0 if confirmed cancelled. Bookings may have been redistributed to other sessions.')
-        if sold_this_period < 0:
-            review_reasons.append('Apparent negative sales — possible refund, capacity change, or scrape error.')
 
         review_flag = bool(review_reasons)
         if review_flag:
