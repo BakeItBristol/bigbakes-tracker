@@ -453,7 +453,6 @@ def build_weekly_deltas(client: AirtableClient, rows: List[NormalizedEvent], scr
             'Days Until Event at Snapshot': days_until,
             'Review Flag': review_flag,
             'Review Reason': '\n'.join(review_reasons),
-            'Effective Tickets Sold': sold_this_period,
         }
         existing = existing_deltas.get(delta_key)
         if existing:
