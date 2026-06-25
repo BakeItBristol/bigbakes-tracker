@@ -96,6 +96,26 @@ def log(message: str):
     print(message, flush=True)
 
 
+def get_reporting_week_key(period_end: str) -> Tuple[int, int]:
+    iso = date.fromisoformat(period_end).isocalendar()
+    return (iso.year, iso.week)
+
+
+def select_latest_periods_by_week(periods: Iterable[str]) -> List[str]:
+    latest_by_week: Dict[Tuple[int, int], str] = {}
+    for period in sorted({p for p in periods if p}):
+        latest_by_week[get_reporting_week_key(period)] = period
+    return [latest_by_week[key] for key in sorted(latest_by_week)]
+
+
+def venue_event_key_formula(venue_short_code: str) -> str:
+    return f"LEFT({{Event Key}},4)='{venue_short_code}-'"
+
+
+def venue_short_code_formula(venue_short_code: str) -> str:
+    return f"{{Venue Short Code}}='{venue_short_code}'"
+
+
 class AirtableClient:
     def __init__(self, base_id: str, pat: str):
         self.base_id = base_id
@@ -109,17 +129,46 @@ class AirtableClient:
     def _url(self, table_name: str) -> str:
         return f"{self.base_url}/{self.base_id}/{requests.utils.quote(table_name)}"
 
-    def list_records(self, table_name: str, fields: Optional[List[str]] = None) -> List[dict]:
+    def _request(self, method: str, table_name: str, *, params: Optional[dict] = None, json_payload: Optional[dict] = None, timeout: int = 60, chunk_index: Optional[int] = None, chunk: Optional[List[dict]] = None) -> requests.Response:
+        retryable_statuses = {408, 409, 429, 500, 502, 503, 504}
+        delays = [2, 5, 15]
+        last_exc = None
+        for attempt in range(len(delays) + 1):
+            try:
+                resp = self.session.request(method, self._url(table_name), params=params, json=json_payload, timeout=timeout)
+                if resp.status_code in retryable_statuses and attempt < len(delays):
+                    time.sleep(delays[attempt])
+                    continue
+                resp.raise_for_status()
+                return resp
+            except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+                last_exc = exc
+                status_code = getattr(getattr(exc, 'response', None), 'status_code', None)
+                is_retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError)) or status_code in retryable_statuses
+                if not is_retryable or attempt >= len(delays):
+                    if chunk is not None:
+                        record_ids = [record.get('id') for record in chunk]
+                        event_keys = [record.get('fields', {}).get('Event Key') for record in chunk]
+                        raise requests.HTTPError(
+                            f'{exc} | table={table_name} chunk_index={chunk_index} record_ids={record_ids} event_keys={event_keys} response={getattr(getattr(exc, "response", None), "text", "")}',
+                            response=getattr(exc, 'response', None),
+                        ) from exc
+                    raise
+                time.sleep(delays[attempt])
+        raise last_exc  # pragma: no cover
+
+    def list_records(self, table_name: str, fields: Optional[List[str]] = None, filter_formula: Optional[str] = None) -> List[dict]:
         records = []
         offset = None
         while True:
-            params = {}
+            params = {'pageSize': 100}
             if offset:
                 params['offset'] = offset
             if fields:
                 params['fields[]'] = fields
-            resp = self.session.get(self._url(table_name), params=params, timeout=60)
-            resp.raise_for_status()
+            if filter_formula:
+                params['filterByFormula'] = filter_formula
+            resp = self._request('GET', table_name, params=params, timeout=60)
             payload = resp.json()
             records.extend(payload.get('records', []))
             offset = payload.get('offset')
@@ -128,19 +177,17 @@ class AirtableClient:
 
     def create_records(self, table_name: str, records: List[dict]) -> List[dict]:
         created = []
-        for chunk in chunked(records, 10):
+        for chunk_index, chunk in enumerate(chunked(records, 10)):
             payload = {'records': [{'fields': rec} for rec in chunk]}
-            resp = self.session.post(self._url(table_name), json=payload, timeout=60)
-            resp.raise_for_status()
+            resp = self._request('POST', table_name, json_payload=payload, timeout=60, chunk_index=chunk_index, chunk=[{'fields': rec} for rec in chunk])
             created.extend(resp.json().get('records', []))
         return created
 
     def update_records(self, table_name: str, records: List[dict]) -> List[dict]:
         updated = []
-        for chunk in chunked(records, 10):
+        for chunk_index, chunk in enumerate(chunked(records, 10)):
             payload = {'records': chunk}
-            resp = self.session.patch(self._url(table_name), json=payload, timeout=60)
-            resp.raise_for_status()
+            resp = self._request('PATCH', table_name, json_payload=payload, timeout=60, chunk_index=chunk_index, chunk=chunk)
             updated.extend(resp.json().get('records', []))
         return updated
 
@@ -292,16 +339,37 @@ def normalize_occurrences(venue_name: str, venue_short_code: str, occurrences: L
 
     deduped = {}
     for row in rows:
-        deduped[(row.venue_name, row.event_date, row.group_id, row.start_time)] = row
+        event_key = row.event_key
+        existing = deduped.get(event_key)
+        if not existing:
+            deduped[event_key] = row
+            continue
+
+        warnings.append(
+            f'Deduped duplicate session for {event_key}: kept one record from DMN groups {existing.group_id} and {row.group_id}.'
+        )
+        deduped[event_key] = max(
+            [existing, row],
+            key=lambda candidate: (
+                candidate.tickets_sold,
+                candidate.api_max_capacity,
+                len(candidate.group_name or ''),
+                candidate.group_id,
+            ),
+        )
+
     normalized = sorted(deduped.values(), key=lambda r: (r.event_date, r.start_time, r.group_id))
     return normalized, warnings
 
 
 def sync_events_and_snapshots(client: AirtableClient, venue_record: dict, venue_cfg: dict, rows: List[NormalizedEvent], scrape_dt: datetime, dry_run: bool) -> dict:
     scraped_date = scrape_dt.date().isoformat()
+    venue_short_code = venue_cfg['short_code']
+    event_filter_formula = venue_short_code_formula(venue_short_code)
+    history_filter_formula = venue_event_key_formula(venue_short_code)
 
-    log('Loading existing Events records from Airtable')
-    existing_events = client.list_records('Events')
+    log(f"Loading existing Events records from Airtable for {venue_cfg['venue_name']}")
+    existing_events = client.list_records('Events', fields=['Event Key', 'Venue Short Code'], filter_formula=event_filter_formula)
     events_by_key = {r['fields'].get('Event Key'): r for r in existing_events if r.get('fields', {}).get('Event Key')}
 
     to_create_events = []
@@ -333,12 +401,12 @@ def sync_events_and_snapshots(client: AirtableClient, venue_record: dict, venue_
         client.update_records('Events', to_update_events)
 
     if created_events or to_update_events:
-        log('Loading existing Events records from Airtable')
-        existing_events = client.list_records('Events')
+        log(f"Reloading existing Events records from Airtable for {venue_cfg['venue_name']}")
+        existing_events = client.list_records('Events', fields=['Event Key', 'Venue Short Code'], filter_formula=event_filter_formula)
         events_by_key = {r['fields'].get('Event Key'): r for r in existing_events if r.get('fields', {}).get('Event Key')}
 
-    log('Loading existing Snapshots records from Airtable')
-    existing_snapshots = client.list_records('Snapshots')
+    log(f"Loading existing Snapshots records from Airtable for {venue_cfg['venue_name']}")
+    existing_snapshots = client.list_records('Snapshots', fields=['Snapshot Key', 'Event Key'], filter_formula=history_filter_formula)
     snapshots_by_key = {r['fields'].get('Snapshot Key'): r for r in existing_snapshots if r.get('fields', {}).get('Snapshot Key')}
 
     to_create_snapshots = []
@@ -381,11 +449,25 @@ def sync_events_and_snapshots(client: AirtableClient, venue_record: dict, venue_
     }
 
 
-def build_weekly_deltas(client: AirtableClient, rows: List[NormalizedEvent], scrape_dt: datetime, dry_run: bool) -> dict:
+def build_weekly_deltas(client: AirtableClient, rows: List[NormalizedEvent], scrape_dt: datetime, venue_short_code: Optional[str] = None, dry_run: bool = False) -> dict:
     affected_keys = {row.event_key for row in rows}
-    log('Loading Snapshots and Weekly Deltas for delta derivation')
-    snapshots = client.list_records('Snapshots')
-    deltas = client.list_records('Weekly Deltas')
+    if venue_short_code is None:
+        venue_short_codes = sorted({row.venue_short_code for row in rows if row.venue_short_code})
+        if len(venue_short_codes) != 1:
+            raise ValueError('build_weekly_deltas requires rows from exactly one venue when venue_short_code is omitted')
+        venue_short_code = venue_short_codes[0]
+    history_filter_formula = venue_event_key_formula(venue_short_code)
+    log(f'Loading Snapshots and Weekly Deltas for delta derivation for {venue_short_code}')
+    snapshots = client.list_records(
+        'Snapshots',
+        fields=['Snapshot Key', 'Event', 'Event Key', 'Scraped At', 'API Max Capacity', 'Effective Capacity', 'Tickets Sold', 'Days Until Event'],
+        filter_formula=history_filter_formula,
+    )
+    deltas = client.list_records(
+        'Weekly Deltas',
+        fields=['Delta Key', 'Event Key', 'Tickets Sold This Period'],
+        filter_formula=history_filter_formula,
+    )
     existing_deltas = {r['fields'].get('Delta Key'): r for r in deltas if r.get('fields', {}).get('Delta Key')}
 
     snapshots_by_event = defaultdict(list)
@@ -406,18 +488,40 @@ def build_weekly_deltas(client: AirtableClient, rows: List[NormalizedEvent], scr
     to_update = []
     flags_raised = 0
 
+    current_period = scrape_dt.date().isoformat()
+
     for event_key, event_snapshots in snapshots_by_event.items():
         if len(event_snapshots) < 2:
             continue
         event_snapshots.sort(key=lambda s: s['fields'].get('Scraped At', ''))
-        prev_snap, curr_snap = event_snapshots[-2], event_snapshots[-1]
+
+        latest_snapshot_by_period: Dict[str, dict] = {}
+        for snapshot in event_snapshots:
+            snapshot_period = str(snapshot['fields'].get('Scraped At', ''))[:10]
+            if snapshot_period:
+                latest_snapshot_by_period[snapshot_period] = snapshot
+
+        comparison_periods = select_latest_periods_by_week(list(latest_snapshot_by_period.keys()))
+        if current_period not in comparison_periods:
+            continue
+
+        current_index = comparison_periods.index(current_period)
+        if current_index == 0:
+            continue
+
+        prev_period = comparison_periods[current_index - 1]
+        prev_snap = latest_snapshot_by_period.get(prev_period)
+        curr_snap = latest_snapshot_by_period.get(current_period)
+        if not prev_snap or not curr_snap:
+            continue
+
         prev_fields = prev_snap['fields']
         curr_fields = curr_snap['fields']
         prev_sold = int(prev_fields.get('Tickets Sold') or 0)
         curr_sold = int(curr_fields.get('Tickets Sold') or 0)
         days_between = (datetime.fromisoformat(curr_fields['Scraped At']) - datetime.fromisoformat(prev_fields['Scraped At'])).days
         sold_this_period = curr_sold - prev_sold
-        prev_period = prior_period_by_event.get(event_key) or 0
+        prior_period_sales = prior_period_by_event.get(event_key) or 0
         review_reasons = []
 
         prev_effective_capacity = int(prev_fields.get('Effective Capacity') or 24)
@@ -425,11 +529,11 @@ def build_weekly_deltas(client: AirtableClient, rows: List[NormalizedEvent], scr
         previous_api_max = int(prev_fields.get('API Max Capacity') or 0)
         days_until = int(curr_fields.get('Days Until Event') or 0)
 
-        if sold_this_period > 18 and days_until < 21 and (prev_effective_capacity - prev_sold) > 5 and int(prev_period or 0) < 5:
+        if sold_this_period > 18 and days_until < 21 and (prev_effective_capacity - prev_sold) > 5 and int(prior_period_sales or 0) < 5:
             review_reasons.append('High-velocity week on previously slow-selling event — likely manual closure redistributing bookings.')
         if current_api_max == 0 and previous_api_max > 0 and days_until > 21:
             review_reasons.append('Likely private hire booking — review and override with 24 if confirmed, or appropriate value if off-platform partial sale.')
-        if current_api_max == 0 and previous_api_max > 0 and days_until <= 21 and int(prev_period or 0) < 5:
+        if current_api_max == 0 and previous_api_max > 0 and days_until <= 21 and int(prior_period_sales or 0) < 5:
             review_reasons.append('Likely manual closure to improve attendance % — review and override with 0 if confirmed cancelled. Bookings may have been redistributed to other sessions.')
 
         review_flag = bool(review_reasons)
@@ -449,7 +553,7 @@ def build_weekly_deltas(client: AirtableClient, rows: List[NormalizedEvent], scr
             'Current Tickets Sold': curr_sold,
             'Days Between Snapshots': days_between,
             'Tickets Sold This Period': sold_this_period,
-            'Previous Period Tickets Sold': int(prev_period or 0),
+            'Previous Period Tickets Sold': int(prior_period_sales or 0),
             'Days Until Event at Snapshot': days_until,
             'Review Flag': review_flag,
             'Review Reason': '\n'.join(review_reasons),
@@ -539,7 +643,7 @@ def main() -> int:
 
             sync_summary = sync_events_and_snapshots(client, venue_record, cfg, normalized, started_at, dry_run=args.dry_run)
             log(f"Sync summary for {cfg['venue_name']}: {sync_summary}")
-            delta_summary = build_weekly_deltas(client, normalized, started_at, dry_run=args.dry_run)
+            delta_summary = build_weekly_deltas(client, normalized, started_at, cfg['short_code'], dry_run=args.dry_run)
             log(f"Delta summary for {cfg['venue_name']}: {delta_summary}")
             total_flags += delta_summary['flags_raised']
             total_deltas += delta_summary['deltas_created'] + delta_summary['deltas_updated']
